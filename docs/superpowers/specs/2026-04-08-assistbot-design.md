@@ -10,9 +10,10 @@ AssistBot 是一个 Telegram 聊天机器人，帮助用户分析、梳理、总
 - **数据源**：免费 + 权威优先，RSS > Reddit > 网页爬取，支持 RSSHub
 - **LLM**：可配置多后端（Claude、OpenAI 等），可切换
 - **使用模式**：主动查询 + 对话式深挖，暂无定时推送
-- **语言**：Python
+- **语言**：Python >= 3.11
 - **部署**：先本地运行，后续再考虑
 - **持久化**：SQLite 轻量持久化
+- **输出语言**：统一中文（英文源内容由 LLM 翻译为中文）
 
 ## 架构
 
@@ -71,7 +72,7 @@ Article:
 | 优先级 | 数据源 | 方式 | 说明 |
 |--------|--------|------|------|
 | 1 | RSS | feedparser | 免费、权威，主力来源。含 RSSHub 支持 |
-| 2 | Reddit | JSON API（.json 后缀） | 免费，无需 API key |
+| 2 | Reddit | JSON API（.json 后缀） | 免费，无需 API key。**风险提示**：Reddit 持续收紧非官方 API，此方式可能随时受限，架构上已通过统一接口预留切换成本 |
 | 3 | 网页爬取 | httpx + BeautifulSoup | 兜底方案 |
 
 ### 预置中文数据源
@@ -86,9 +87,17 @@ Article:
 
 ### 采集流程
 
-1. 根据 topic 关键词，从已配置的数据源并行抓取
+1. 根据 topic 关键词，从已配置的数据源并行抓取（最大并发 5，单源超时 15 秒）
 2. 按 `published_at` 排序，URL 去重
 3. 返回最近 N 篇（默认 20 篇）交给预处理
+
+### Topic 匹配逻辑
+
+用户输入为自然语言（如"AI 最新资讯"），需要映射到已配置的 topic 标签：
+
+1. **关键词匹配**：提取用户输入中的关键词，与数据源配置的 `topics` 字段做模糊匹配
+2. **LLM 辅助分类**：当关键词匹配无结果时，用 LLM 从用户输入中提取 topic 意图，匹配最接近的已配置 topic
+3. **未配置 topic 的处理**：如果用户查询的 topic 完全不在已配置范围内，告知用户当前支持的 topic 列表，并建议通过 `/addrss` 添加相关数据源
 
 ## 文章预处理（智能提取）
 
@@ -164,7 +173,8 @@ chat(message: str, context: list[Message]) -> str
 ### 上下文长度控制
 
 - 对话历史最多保留最近 10 轮
-- 超出时，用 LLM 对早期对话做压缩摘要，保留关键信息
+- 同时监控 token 数，超过阈值（如 4000 tokens）也触发压缩
+- 压缩方式：用 LLM 对早期对话做压缩摘要，保留关键信息
 
 ## Telegram Bot 交互
 
@@ -187,27 +197,29 @@ chat(message: str, context: list[Message]) -> str
 
 ### 响应体验
 
-- 先发"正在为你搜集资讯..."提示
-- 使用 Telegram Markdown 格式化
+- 先发"正在为你搜集资讯..."提示，同时发送 `ChatAction.TYPING` 持续显示输入状态
+- 使用 Telegram HTML 格式化（避免 MarkdownV2 复杂的转义规则）
 - 每条资讯附原文链接
+- **消息长度处理**：Telegram 单条消息上限 4096 字符。摘要分为概览（Top 5 条 + 综合分析）和完整列表两部分，概览先发，用户点击"查看更多"后发送剩余条目
 
 ### 权限控制
 
 - 配置文件中设置 Telegram user_id 白名单
-- 防止陌生人滥用
+- 白名单外用户发送消息时，回复"抱歉，您没有使用权限"并忽略后续消息
+- 防止陌生人滥用 API 额度
 
 ## 配置管理
 
-统一使用 `config.yaml`，敏感信息支持环境变量覆盖：
+统一使用 `config.yaml` + 环境变量。**敏感信息（API key、bot token）默认从环境变量读取**，yaml 中只放非敏感配置：
 
 ```yaml
 telegram:
-  bot_token: "your-bot-token"
+  # bot_token 从环境变量 TELEGRAM_BOT_TOKEN 读取
   allowed_users: [123456789]
 
 llm:
   provider: "claude"
-  api_key: "your-api-key"
+  # api_key 从环境变量 LLM_API_KEY 读取
   summary_model: "claude-haiku-4-5-20251001"
   analysis_model: "claude-sonnet-4-6"
 
@@ -240,6 +252,84 @@ session_timeout: 600
 - **Topic 配置**：用户自定义的 RSS 源和 topic 映射
 - **对话会话**：会话 ID、chat_id、topic、对话历史、关联文章
 - **资讯缓存**：已抓取文章及其摘要，带 TTL 过期机制
+
+## 错误处理策略
+
+### 数据源层
+
+- **单源失败**：记录错误日志，跳过该源，继续其他源的采集
+- **全源失败**：回复用户"数据源暂时不可用，请稍后再试"，附带失败原因概要
+- **单源超时**：15 秒超时，超时视为失败，走单源失败逻辑
+
+### LLM 层
+
+- **API 调用失败**：重试 1 次（间隔 2 秒），仍失败则尝试降级到备用模型
+- **降级策略**：analysis_model 失败 → 用 summary_model 替代；summary_model 也失败 → 直接返回原始文章列表（跳过 LLM 摘要）
+- **Rate limit**：捕获 429 错误，回复用户"请求过于频繁，请稍后再试"
+
+### Bot 层
+
+- 所有未捕获异常兜底处理，回复用户"处理出错，请重试"，避免 Bot 静默无响应
+
+## 日志策略
+
+使用 Python 标准 `logging` 模块：
+
+- **INFO**：采集成功/失败、LLM 调用结果、用户命令
+- **WARNING**：单源超时、rate limit、降级触发
+- **ERROR**：全源失败、LLM 调用异常、未捕获异常
+- **关键指标追踪**：LLM 调用耗时、token 用量、每次查询的数据源命中数
+
+## 数据库 Schema（SQLite）
+
+```sql
+-- 用户自定义 RSS 源
+CREATE TABLE custom_feeds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    topics TEXT NOT NULL,          -- JSON 数组，如 '["ai","tech"]'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 对话会话
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,           -- UUID
+    chat_id INTEGER NOT NULL,
+    topic TEXT NOT NULL,
+    articles TEXT NOT NULL,        -- JSON 数组，关联的文章列表
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 对话历史
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    role TEXT NOT NULL,            -- 'user' 或 'assistant'
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 资讯缓存
+CREATE TABLE article_cache (
+    url TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    source TEXT NOT NULL,
+    content TEXT,                  -- 原始内容
+    summary TEXT,                  -- LLM 生成的摘要（缓存）
+    language TEXT,
+    published_at TIMESTAMP,
+    cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+## 多语言处理
+
+- 所有摘要和分析输出统一为**中文**
+- 英文源（如 Reddit、英文 RSS）的内容，在 LLM 摘要阶段翻译为中文
+- LLM prompt 中明确要求"请用中文输出"
 
 ## 技术栈
 
