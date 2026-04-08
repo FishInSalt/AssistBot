@@ -40,8 +40,8 @@ class RSSSource(BaseSource):
 
     def _parse_date(self, entry) -> datetime:
         if hasattr(entry, "published_parsed") and entry.published_parsed:
-            from time import mktime
-            return datetime.fromtimestamp(mktime(entry.published_parsed), tz=timezone.utc)
+            import calendar
+            return datetime.fromtimestamp(calendar.timegm(entry.published_parsed), tz=timezone.utc)
         if hasattr(entry, "published") and entry.published:
             try:
                 return parsedate_to_datetime(entry.published)

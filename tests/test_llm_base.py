@@ -11,7 +11,7 @@ class MockLLM(BaseLLM):
     async def summarize(self, articles: list[Article], topic: str) -> str:
         self.summarize_called = True
         return "Mock summary"
-    async def chat(self, message: str, context: list[ChatMessage]) -> str:
+    async def chat(self, message: str, context: list[ChatMessage], articles_context: str = "") -> str:
         self.chat_called = True
         return "Mock reply"
     async def compress_context(self, messages: list[ChatMessage]) -> str:

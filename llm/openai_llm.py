@@ -8,7 +8,7 @@ from storage.models import Article, ChatMessage
 
 logger = logging.getLogger(__name__)
 
-from llm.claude import (
+from llm.prompts import (
     SUMMARIZE_SYSTEM, CHAT_SYSTEM, COMPRESS_SYSTEM,
     EXTRACT_TOPIC_SYSTEM, SINGLE_SUMMARY_SYSTEM,
 )
@@ -27,8 +27,11 @@ class OpenAILLM(BaseLLM):
         system = SUMMARIZE_SYSTEM.format(topic=topic, date=date.today().isoformat())
         return await self._call_with_retry(self._analysis_model, system, articles_text)
 
-    async def chat(self, message: str, context: list[ChatMessage]) -> str:
-        messages = [{"role": "system", "content": CHAT_SYSTEM}]
+    async def chat(self, message: str, context: list[ChatMessage], articles_context: str = "") -> str:
+        system = CHAT_SYSTEM
+        if articles_context:
+            system = f"{CHAT_SYSTEM}\n\n{articles_context}"
+        messages = [{"role": "system", "content": system}]
         messages.extend({"role": m.role, "content": m.content} for m in context)
         messages.append({"role": "user", "content": message})
         return await self._call_messages_with_retry(self._analysis_model, messages)

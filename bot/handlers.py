@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time as _time
 import uuid
 from urllib.parse import urlparse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -58,7 +59,7 @@ class AssistBotHandlers:
         self._llm = llm
         self._db = db
         self._allowed_users = allowed_users
-        self._pending_more: dict[str, str] = {}  # callback_id -> remaining text
+        self._pending_more: dict[str, tuple[float, str]] = {}  # callback_id -> (timestamp, text)
 
     def _is_authorized(self, user_id: int) -> bool:
         return not self._allowed_users or user_id in self._allowed_users
@@ -95,13 +96,13 @@ class AssistBotHandlers:
         custom = await self._db.get_custom_feeds(chat_id)
         topics = self._topic_matcher.available_topics(custom_feeds=custom)
 
-        lines = ["<b>📡 数据源列表</b>\n"]
-        lines.append(f"<b>支持的话题：</b> {', '.join(topics)}\n")
+        lines = ["📡 数据源列表\n"]
+        lines.append(f"支持的话题: {', '.join(topics)}\n")
         if custom:
-            lines.append("<b>自定义 RSS：</b>")
+            lines.append("自定义 RSS:")
             for feed in custom:
                 lines.append(f"• {feed['name']} — {feed['url']}")
-        await update.message.reply_html("\n".join(lines))
+        await update.message.reply_text("\n".join(lines))
 
     async def addrss_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_auth(update):
@@ -150,9 +151,18 @@ class AssistBotHandlers:
 
         chat_id = update.effective_chat.id
 
-        # Check if user has an active session (follow-up question)
-        if await self._conversation.has_active_session(chat_id):
-            await self._handle_followup(update, text)
+        # Check if user has an active session
+        session_row = await self._conversation.get_active_session_if_valid(chat_id)
+        if session_row:
+            # Try to detect if user wants a new topic
+            custom_feeds = await self._db.get_custom_feeds(chat_id)
+            new_topic = await self._topic_matcher.match(text, custom_feeds=custom_feeds)
+            if new_topic and new_topic != session_row["topic"]:
+                # User wants a different topic — start new query
+                await self._handle_topic_query(update, text)
+            else:
+                # Same topic or no topic detected — treat as follow-up
+                await self._handle_followup(update, text)
         else:
             await self._handle_topic_query(update, text)
 
@@ -203,7 +213,7 @@ class AssistBotHandlers:
             while True:
                 await update.message.chat.send_action(ChatAction.TYPING)
                 await asyncio.sleep(5)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
 
     async def _handle_followup(self, update: Update, text: str) -> None:
@@ -219,14 +229,30 @@ class AssistBotHandlers:
         await self._conversation.add_message(session_id, "user", text)
         context = await self._conversation.get_context(session_id)
 
+        # Include article context from the session
+        articles_json = session_row.get("articles", "[]")
+        articles_context = self._format_articles_context(articles_json)
+
         try:
-            reply = await self._llm.chat(text, context)
+            reply = await self._llm.chat(text, context, articles_context=articles_context)
         except Exception:
             logger.error("LLM chat failed", exc_info=True)
             reply = "处理出错，请重试。"
 
         await self._conversation.add_message(session_id, "assistant", reply)
         await self._send_long_message(update, reply)
+
+    def _format_articles_context(self, articles_json: str) -> str:
+        try:
+            articles = json.loads(articles_json)
+            if not articles:
+                return ""
+            lines = ["以下是本次查询获取的文章列表："]
+            for i, a in enumerate(articles, 1):
+                lines.append(f"{i}. {a.get('title', '')} — {a.get('source', '')} ({a.get('url', '')})")
+            return "\n".join(lines)
+        except (json.JSONDecodeError, TypeError):
+            return ""
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("Unhandled exception", exc_info=context.error)
@@ -235,6 +261,12 @@ class AssistBotHandlers:
                 await update.message.reply_text("处理出错，请重试。")
             except Exception:
                 pass
+
+    def _cleanup_pending_more(self) -> None:
+        now = _time.time()
+        expired = [k for k, (ts, _) in self._pending_more.items() if now - ts > 600]
+        for k in expired:
+            del self._pending_more[k]
 
     async def _send_long_message(self, update: Update, text: str) -> None:
         if len(text) <= MAX_MESSAGE_LENGTH:
@@ -250,7 +282,8 @@ class AssistBotHandlers:
 
         if remaining:
             callback_id = str(uuid.uuid4())[:8]
-            self._pending_more[callback_id] = remaining
+            self._cleanup_pending_more()
+            self._pending_more[callback_id] = (_time.time(), remaining)
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📋 查看更多", callback_data=f"more:{callback_id}")]
             ])
@@ -265,10 +298,11 @@ class AssistBotHandlers:
         if not data.startswith("more:"):
             return
         callback_id = data[5:]
-        remaining = self._pending_more.pop(callback_id, None)
-        if not remaining:
+        entry = self._pending_more.pop(callback_id, None)
+        if not entry:
             await query.message.reply_text("内容已过期，请重新查询。")
             return
+        _, remaining = entry
 
         # Send remaining content in chunks if needed
         while remaining:

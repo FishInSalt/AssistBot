@@ -30,6 +30,7 @@ def make_handlers():
 
     mock_conversation = AsyncMock()
     mock_conversation.has_active_session = AsyncMock(return_value=False)
+    mock_conversation.get_active_session_if_valid = AsyncMock(return_value=None)
     mock_conversation.get_or_create_session = AsyncMock(return_value=MagicMock(id="s1"))
     mock_conversation.add_message = AsyncMock()
     mock_conversation.get_context = AsyncMock(return_value=[])
@@ -90,4 +91,4 @@ async def test_sources_command():
     handlers = make_handlers()
     update = make_update("/sources", user_id=111)
     await handlers.sources_cmd(update, make_context())
-    update.message.reply_html.assert_called_once()
+    update.message.reply_text.assert_called_once()

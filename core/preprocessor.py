@@ -4,7 +4,6 @@ from bs4 import BeautifulSoup
 from storage.models import Article
 
 logger = logging.getLogger(__name__)
-METADATA_THRESHOLD = 100
 
 class Preprocessor:
     """Three-level article content extraction."""
