@@ -6,7 +6,7 @@
 
 **Architecture:** Single-process Python async app. Telegram bot receives messages, routes them through a pipeline that fetches from data sources (RSS/Reddit/scraper), preprocesses articles, and uses a configurable LLM backend to generate summaries. SQLite stores sessions, article cache, and custom feeds.
 
-**Tech Stack:** Python 3.11+, python-telegram-bot, feedparser, httpx, beautifulsoup4, anthropic SDK, openai SDK, SQLite, PyYAML, pytest + pytest-asyncio
+**Tech Stack:** Python 3.11+, python-telegram-bot, feedparser, httpx, beautifulsoup4, anthropic SDK (async), openai SDK (async), aiosqlite, PyYAML, pytest + pytest-asyncio
 
 ---
 
@@ -23,7 +23,7 @@ AssistBot/
 ├── storage/
 │   ├── __init__.py
 │   ├── models.py              # Dataclasses: Article, Session, Message
-│   └── database.py            # SQLite operations (async-compatible via run_in_executor)
+│   └── database.py            # SQLite operations (async via aiosqlite)
 ├── sources/
 │   ├── __init__.py
 │   ├── base.py                # Abstract base class for data sources
@@ -85,6 +85,7 @@ httpx>=0.27
 beautifulsoup4>=4.12
 anthropic>=0.40
 openai>=1.50
+aiosqlite>=0.20
 PyYAML>=6.0
 ```
 
@@ -150,6 +151,7 @@ sources:
     - subreddit: "worldnews"
       topics: ["international"]
 
+db_path: "assistbot.db"
 cache_ttl: 3600
 max_articles: 20
 session_timeout: 600
@@ -186,6 +188,7 @@ sources:
     - subreddit: "test"
       topics: ["test"]
 
+db_path: "test.db"
 cache_ttl: 3600
 max_articles: 20
 session_timeout: 600
@@ -285,6 +288,7 @@ class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     sources: SourcesConfig = field(default_factory=SourcesConfig)
+    db_path: str = "assistbot.db"
     cache_ttl: int = 3600
     max_articles: int = 20
     session_timeout: int = 600
@@ -319,6 +323,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         telegram=telegram,
         llm=llm,
         sources=sources,
+        db_path=raw.get("db_path", "assistbot.db"),
         cache_ttl=raw.get("cache_ttl", 3600),
         max_articles=raw.get("max_articles", 20),
         session_timeout=raw.get("session_timeout", 600),
@@ -486,15 +491,30 @@ git commit -m "feat: add Article, Session, ChatMessage data models"
 Append to `tests/conftest.py`:
 
 ```python
-import asyncio
 from storage.database import Database
 
 @pytest.fixture
-def db(tmp_path):
+async def db(tmp_path):
     db_path = tmp_path / "test.db"
     database = Database(str(db_path))
-    asyncio.get_event_loop().run_until_complete(database.init())
+    await database.init()
     yield database
+    await database.close()
+```
+
+Also create `pyproject.toml` (or add to conftest) for pytest-asyncio config:
+
+```python
+# Add to conftest.py top
+import pytest
+pytest_plugins = ['pytest_asyncio']
+```
+
+Create `pyproject.toml`:
+
+```toml
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 ```
 
 - [ ] **Step 2: Write failing tests for database**
@@ -502,14 +522,12 @@ def db(tmp_path):
 Create `tests/test_database.py`:
 
 ```python
-import asyncio
+import pytest
 from datetime import datetime, timezone
 from storage.models import Article
 
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
-def test_cache_article_and_retrieve(db):
+async def test_cache_article_and_retrieve(db):
     article = Article(
         title="Test Article",
         url="https://example.com/1",
@@ -519,17 +537,19 @@ def test_cache_article_and_retrieve(db):
         language="zh",
         summary="A test summary",
     )
-    run(db.cache_article(article))
-    cached = run(db.get_cached_article("https://example.com/1"))
+    await db.cache_article(article)
+    cached = await db.get_cached_article("https://example.com/1")
     assert cached is not None
     assert cached.title == "Test Article"
     assert cached.summary == "A test summary"
 
-def test_get_cached_article_miss(db):
-    cached = run(db.get_cached_article("https://nonexistent.com"))
+
+async def test_get_cached_article_miss(db):
+    cached = await db.get_cached_article("https://nonexistent.com")
     assert cached is None
 
-def test_cache_article_upsert(db):
+
+async def test_cache_article_upsert(db):
     article = Article(
         title="Original",
         url="https://example.com/1",
@@ -537,42 +557,66 @@ def test_cache_article_upsert(db):
         published_at=datetime(2026, 4, 8, tzinfo=timezone.utc),
         content="Content",
     )
-    run(db.cache_article(article))
+    await db.cache_article(article)
     article.summary = "New summary"
-    run(db.cache_article(article))
-    cached = run(db.get_cached_article("https://example.com/1"))
+    await db.cache_article(article)
+    cached = await db.get_cached_article("https://example.com/1")
     assert cached.summary == "New summary"
 
-def test_save_and_get_custom_feed(db):
-    run(db.add_custom_feed(chat_id=123, name="MyFeed", url="https://example.com/rss", topics=["ai"]))
-    feeds = run(db.get_custom_feeds(chat_id=123))
+
+async def test_cache_ttl_expired(db):
+    """Cached article with expired TTL should return None."""
+    article = Article(
+        title="Old",
+        url="https://example.com/old",
+        source="Src",
+        published_at=datetime(2026, 4, 8, tzinfo=timezone.utc),
+        content="Content",
+    )
+    await db.cache_article(article)
+    # Manually set cached_at to old timestamp
+    await db._execute(
+        "UPDATE article_cache SET cached_at = '2020-01-01T00:00:00' WHERE url = ?",
+        ("https://example.com/old",),
+    )
+    await db._commit()
+    cached = await db.get_cached_article("https://example.com/old", cache_ttl=3600)
+    assert cached is None
+
+
+async def test_save_and_get_custom_feed(db):
+    await db.add_custom_feed(chat_id=123, name="MyFeed", url="https://example.com/rss", topics=["ai"])
+    feeds = await db.get_custom_feeds(chat_id=123)
     assert len(feeds) == 1
     assert feeds[0]["name"] == "MyFeed"
     assert feeds[0]["topics"] == ["ai"]
 
-def test_remove_custom_feed(db):
-    run(db.add_custom_feed(chat_id=123, name="MyFeed", url="https://example.com/rss", topics=["ai"]))
-    removed = run(db.remove_custom_feed(chat_id=123, url="https://example.com/rss"))
+
+async def test_remove_custom_feed(db):
+    await db.add_custom_feed(chat_id=123, name="MyFeed", url="https://example.com/rss", topics=["ai"])
+    removed = await db.remove_custom_feed(chat_id=123, url="https://example.com/rss")
     assert removed is True
-    feeds = run(db.get_custom_feeds(chat_id=123))
+    feeds = await db.get_custom_feeds(chat_id=123)
     assert len(feeds) == 0
 
-def test_save_and_load_session(db):
-    run(db.save_session(
+
+async def test_save_and_load_session(db):
+    await db.save_session(
         session_id="s1",
         chat_id=123,
         topic="ai",
         articles_json='[{"title":"t1"}]',
-    ))
-    session_row = run(db.get_active_session(chat_id=123))
+    )
+    session_row = await db.get_active_session(chat_id=123)
     assert session_row is not None
     assert session_row["topic"] == "ai"
 
-def test_save_and_load_messages(db):
-    run(db.save_session(session_id="s1", chat_id=123, topic="ai", articles_json="[]"))
-    run(db.add_message(session_id="s1", role="user", content="hello"))
-    run(db.add_message(session_id="s1", role="assistant", content="hi"))
-    messages = run(db.get_messages(session_id="s1"))
+
+async def test_save_and_load_messages(db):
+    await db.save_session(session_id="s1", chat_id=123, topic="ai", articles_json="[]")
+    await db.add_message(session_id="s1", role="user", content="hello")
+    await db.add_message(session_id="s1", role="assistant", content="hi")
+    messages = await db.get_messages(session_id="s1")
     assert len(messages) == 2
     assert messages[0]["role"] == "user"
     assert messages[1]["role"] == "assistant"
@@ -589,26 +633,22 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'storage.database'`
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import datetime, timezone
-from functools import partial
-from asyncio import get_event_loop
+
+import aiosqlite
+
 from storage.models import Article
 
 
 class Database:
     def __init__(self, db_path: str = "assistbot.db"):
         self._path = db_path
-        self._conn: sqlite3.Connection | None = None
+        self._conn: aiosqlite.Connection | None = None
 
     async def init(self) -> None:
-        loop = get_event_loop()
-        self._conn = await loop.run_in_executor(None, partial(sqlite3.connect, self._path))
-        self._conn.row_factory = sqlite3.Row
-        await loop.run_in_executor(None, self._create_tables)
-
-    def _create_tables(self) -> None:
-        self._conn.executescript("""
+        self._conn = await aiosqlite.connect(self._path)
+        self._conn.row_factory = aiosqlite.Row
+        await self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS custom_feeds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
@@ -643,14 +683,17 @@ class Database:
                 cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        await self._conn.commit()
 
-    async def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        loop = get_event_loop()
-        return await loop.run_in_executor(None, partial(self._conn.execute, sql, params))
+    async def close(self) -> None:
+        if self._conn:
+            await self._conn.close()
+
+    async def _execute(self, sql: str, params: tuple = ()) -> aiosqlite.Cursor:
+        return await self._conn.execute(sql, params)
 
     async def _commit(self) -> None:
-        loop = get_event_loop()
-        await loop.run_in_executor(None, self._conn.commit)
+        await self._conn.commit()
 
     # --- Article Cache ---
 
@@ -666,10 +709,16 @@ class Database:
         )
         await self._commit()
 
-    async def get_cached_article(self, url: str) -> Article | None:
-        cursor = await self._execute("SELECT * FROM article_cache WHERE url = ?", (url,))
-        loop = get_event_loop()
-        row = await loop.run_in_executor(None, cursor.fetchone)
+    async def get_cached_article(self, url: str, cache_ttl: int = 0) -> Article | None:
+        if cache_ttl > 0:
+            cursor = await self._execute(
+                """SELECT * FROM article_cache
+                   WHERE url = ? AND cached_at > datetime('now', ? || ' seconds')""",
+                (url, str(-cache_ttl)),
+            )
+        else:
+            cursor = await self._execute("SELECT * FROM article_cache WHERE url = ?", (url,))
+        row = await cursor.fetchone()
         if row is None:
             return None
         published_at = datetime.fromisoformat(row["published_at"]) if row["published_at"] else None
@@ -705,8 +754,7 @@ class Database:
             "SELECT name, url, topics FROM custom_feeds WHERE chat_id = ?",
             (chat_id,),
         )
-        loop = get_event_loop()
-        rows = await loop.run_in_executor(None, cursor.fetchall)
+        rows = await cursor.fetchall()
         return [{"name": r["name"], "url": r["url"], "topics": json.loads(r["topics"])} for r in rows]
 
     # --- Sessions ---
@@ -725,8 +773,7 @@ class Database:
             "SELECT * FROM sessions WHERE chat_id = ? ORDER BY updated_at DESC LIMIT 1",
             (chat_id,),
         )
-        loop = get_event_loop()
-        row = await loop.run_in_executor(None, cursor.fetchone)
+        row = await cursor.fetchone()
         if row is None:
             return None
         return dict(row)
@@ -750,15 +797,14 @@ class Database:
             "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,),
         )
-        loop = get_event_loop()
-        rows = await loop.run_in_executor(None, cursor.fetchall)
+        rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cd /Users/z/Z/AssistBot && python -m pytest tests/test_database.py -v`
-Expected: 7 passed
+Expected: 8 passed
 
 - [ ] **Step 6: Commit**
 
@@ -784,13 +830,8 @@ Create `sources/__init__.py` (empty file).
 Create `tests/test_rss.py`:
 
 ```python
-import asyncio
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 from sources.rss import RSSSource
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 SAMPLE_FEED = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -816,7 +857,7 @@ def test_rss_source_implements_base():
     source = RSSSource(name="Test", url="https://example.com/rss", topics=["test"])
     assert isinstance(source, BaseSource)
 
-def test_rss_parse_articles():
+async def test_rss_parse_articles():
     source = RSSSource(name="TestFeed", url="https://example.com/rss", topics=["test"])
 
     mock_response = MagicMock()
@@ -830,7 +871,7 @@ def test_rss_parse_articles():
         mock_client.__aexit__ = AsyncMock(return_value=False)
         MockClient.return_value = mock_client
 
-        articles = run(source.fetch())
+        articles = await source.fetch()
 
     assert len(articles) == 2
     assert articles[0].title == "Article One"
@@ -838,7 +879,7 @@ def test_rss_parse_articles():
     assert articles[0].url == "https://example.com/1"
     assert "First article" in articles[0].content
 
-def test_rss_fetch_failure_returns_empty():
+async def test_rss_fetch_failure_returns_empty():
     source = RSSSource(name="Bad", url="https://bad.example.com/rss", topics=["test"])
 
     with patch("sources.rss.httpx.AsyncClient") as MockClient:
@@ -848,7 +889,7 @@ def test_rss_fetch_failure_returns_empty():
         mock_client.__aexit__ = AsyncMock(return_value=False)
         MockClient.return_value = mock_client
 
-        articles = run(source.fetch())
+        articles = await source.fetch()
 
     assert articles == []
 ```
@@ -969,13 +1010,8 @@ git commit -m "feat: base source interface and RSS source implementation"
 Create `tests/test_reddit.py`:
 
 ```python
-import asyncio
-import json
 from unittest.mock import AsyncMock, patch, MagicMock
 from sources.reddit import RedditSource
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 SAMPLE_REDDIT_JSON = {
     "data": {
@@ -1011,7 +1047,7 @@ def test_reddit_source_implements_base():
     source = RedditSource(subreddit="artificial", topics=["ai"])
     assert isinstance(source, BaseSource)
 
-def test_reddit_parse_posts():
+async def test_reddit_parse_posts():
     source = RedditSource(subreddit="artificial", topics=["ai"])
 
     mock_response = MagicMock()
@@ -1025,14 +1061,14 @@ def test_reddit_parse_posts():
         mock_client.__aexit__ = AsyncMock(return_value=False)
         MockClient.return_value = mock_client
 
-        articles = run(source.fetch())
+        articles = await source.fetch()
 
     assert len(articles) == 2
     assert articles[0].title == "Big AI News"
     assert articles[0].source == "Reddit r/artificial"
     assert articles[0].language == "en"
 
-def test_reddit_fetch_failure_returns_empty():
+async def test_reddit_fetch_failure_returns_empty():
     source = RedditSource(subreddit="bad", topics=["test"])
 
     with patch("sources.reddit.httpx.AsyncClient") as MockClient:
@@ -1042,7 +1078,7 @@ def test_reddit_fetch_failure_returns_empty():
         mock_client.__aexit__ = AsyncMock(return_value=False)
         MockClient.return_value = mock_client
 
-        articles = run(source.fetch())
+        articles = await source.fetch()
 
     assert articles == []
 ```
@@ -1052,12 +1088,8 @@ def test_reddit_fetch_failure_returns_empty():
 Create `tests/test_scraper.py`:
 
 ```python
-import asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
 from sources.scraper import ScraperSource
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 SAMPLE_HTML = """
 <html>
@@ -1081,7 +1113,7 @@ def test_scraper_implements_base():
     source = ScraperSource(name="Test", url="https://example.com", topics=["test"])
     assert isinstance(source, BaseSource)
 
-def test_scraper_extracts_content():
+async def test_scraper_extracts_content():
     source = ScraperSource(name="TestSite", url="https://example.com", topics=["ai"])
 
     mock_response = MagicMock()
@@ -1095,13 +1127,13 @@ def test_scraper_extracts_content():
         mock_client.__aexit__ = AsyncMock(return_value=False)
         MockClient.return_value = mock_client
 
-        articles = run(source.fetch())
+        articles = await source.fetch()
 
     assert len(articles) == 1
     assert articles[0].title == "AI Advances in 2026"
     assert articles[0].source == "TestSite"
 
-def test_scraper_failure_returns_empty():
+async def test_scraper_failure_returns_empty():
     source = ScraperSource(name="Bad", url="https://bad.example.com", topics=["test"])
 
     with patch("sources.scraper.httpx.AsyncClient") as MockClient:
@@ -1111,7 +1143,7 @@ def test_scraper_failure_returns_empty():
         mock_client.__aexit__ = AsyncMock(return_value=False)
         MockClient.return_value = mock_client
 
-        articles = run(source.fetch())
+        articles = await source.fetch()
 
     assert articles == []
 ```
@@ -1438,14 +1470,10 @@ Create `llm/__init__.py` (empty file).
 Create `tests/test_llm_base.py`:
 
 ```python
-import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 from storage.models import Article, ChatMessage
 from llm.base import BaseLLM, create_llm
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 class MockLLM(BaseLLM):
@@ -1478,22 +1506,22 @@ def test_base_llm_is_abstract():
         BaseLLM()
 
 
-def test_mock_llm_summarize():
+async def test_mock_llm_summarize():
     llm = MockLLM()
     articles = [
         Article(title="T1", url="https://example.com/1", source="S1",
                 published_at=datetime(2026, 4, 8, tzinfo=timezone.utc),
                 content="Content 1"),
     ]
-    result = run(llm.summarize(articles, "ai"))
+    result = await llm.summarize(articles, "ai")
     assert result == "Mock summary"
     assert llm.summarize_called
 
 
-def test_mock_llm_chat():
+async def test_mock_llm_chat():
     llm = MockLLM()
     context = [ChatMessage(role="user", content="hello")]
-    result = run(llm.chat("follow up", context))
+    result = await llm.chat("follow up", context)
     assert result == "Mock reply"
     assert llm.chat_called
 
@@ -1575,6 +1603,7 @@ def create_llm(provider: str, api_key: str, summary_model: str, analysis_model: 
 ```python
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -1614,7 +1643,7 @@ SINGLE_SUMMARY_SYSTEM = """请用一段话（50-100字）总结以下文章的�
 
 class ClaudeLLM(BaseLLM):
     def __init__(self, api_key: str, summary_model: str, analysis_model: str):
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._summary_model = summary_model
         self._analysis_model = analysis_model
 
@@ -1625,31 +1654,65 @@ class ClaudeLLM(BaseLLM):
             for a in articles
         )
         system = SUMMARIZE_SYSTEM.format(topic=topic, date=date.today().isoformat())
-        return await self._call(self._analysis_model, system, articles_text)
+        return await self._call_with_retry(self._analysis_model, system, articles_text)
 
     async def chat(self, message: str, context: list[ChatMessage]) -> str:
         messages = [{"role": m.role, "content": m.content} for m in context]
         messages.append({"role": "user", "content": message})
-        return await self._call_messages(self._analysis_model, CHAT_SYSTEM, messages)
+        return await self._call_messages_with_retry(self._analysis_model, CHAT_SYSTEM, messages)
 
     async def compress_context(self, messages: list[ChatMessage]) -> str:
         text = "\n".join(f"{m.role}: {m.content}" for m in messages)
-        return await self._call(self._summary_model, COMPRESS_SYSTEM, text)
+        return await self._call_with_retry(self._summary_model, COMPRESS_SYSTEM, text)
 
     async def extract_topic(self, user_input: str, available_topics: list[str]) -> str | None:
         system = EXTRACT_TOPIC_SYSTEM.format(topics=", ".join(available_topics))
-        result = await self._call(self._summary_model, system, user_input)
+        result = await self._call_with_retry(self._summary_model, system, user_input)
         result = result.strip().lower()
         return result if result != "none" and result in available_topics else None
 
     async def summarize_single(self, article: Article) -> str:
         text = f"标题: {article.title}\n内容: {article.content[:3000]}"
-        return await self._call(self._summary_model, SINGLE_SUMMARY_SYSTEM, text)
+        return await self._call_with_retry(self._summary_model, SINGLE_SUMMARY_SYSTEM, text)
+
+    async def _call_with_retry(self, model: str, system: str, user_text: str) -> str:
+        """Call with 1 retry (2s delay). On analysis_model failure, degrade to summary_model."""
+        try:
+            return await self._call(model, system, user_text)
+        except anthropic.RateLimitError:
+            raise  # Don't retry rate limits, propagate immediately
+        except Exception:
+            logger.warning("Claude %s call failed, retrying in 2s...", model)
+            await asyncio.sleep(2)
+            try:
+                return await self._call(model, system, user_text)
+            except Exception:
+                if model == self._analysis_model and model != self._summary_model:
+                    logger.warning("Degrading from %s to %s", model, self._summary_model)
+                    return await self._call(self._summary_model, system, user_text)
+                raise
+
+    async def _call_messages_with_retry(self, model: str, system: str, messages: list[dict]) -> str:
+        """Call with 1 retry (2s delay). On analysis_model failure, degrade to summary_model."""
+        try:
+            return await self._call_messages(model, system, messages)
+        except anthropic.RateLimitError:
+            raise
+        except Exception:
+            logger.warning("Claude %s call failed, retrying in 2s...", model)
+            await asyncio.sleep(2)
+            try:
+                return await self._call_messages(model, system, messages)
+            except Exception:
+                if model == self._analysis_model and model != self._summary_model:
+                    logger.warning("Degrading from %s to %s", model, self._summary_model)
+                    return await self._call_messages(self._summary_model, system, messages)
+                raise
 
     async def _call(self, model: str, system: str, user_text: str) -> str:
         start = time.time()
         try:
-            response = self._client.messages.create(
+            response = await self._client.messages.create(
                 model=model,
                 max_tokens=2048,
                 system=system,
@@ -1667,7 +1730,7 @@ class ClaudeLLM(BaseLLM):
     async def _call_messages(self, model: str, system: str, messages: list[dict]) -> str:
         start = time.time()
         try:
-            response = self._client.messages.create(
+            response = await self._client.messages.create(
                 model=model,
                 max_tokens=2048,
                 system=system,
@@ -1688,6 +1751,7 @@ class ClaudeLLM(BaseLLM):
 ```python
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -1710,7 +1774,7 @@ from llm.claude import (
 
 class OpenAILLM(BaseLLM):
     def __init__(self, api_key: str, summary_model: str, analysis_model: str):
-        self._client = openai.OpenAI(api_key=api_key)
+        self._client = openai.AsyncOpenAI(api_key=api_key)
         self._summary_model = summary_model
         self._analysis_model = analysis_model
 
@@ -1721,52 +1785,56 @@ class OpenAILLM(BaseLLM):
             for a in articles
         )
         system = SUMMARIZE_SYSTEM.format(topic=topic, date=date.today().isoformat())
-        return await self._call(self._analysis_model, system, articles_text)
+        return await self._call_with_retry(self._analysis_model, system, articles_text)
 
     async def chat(self, message: str, context: list[ChatMessage]) -> str:
         messages = [{"role": "system", "content": CHAT_SYSTEM}]
         messages.extend({"role": m.role, "content": m.content} for m in context)
         messages.append({"role": "user", "content": message})
-        return await self._call_messages(self._analysis_model, messages)
+        return await self._call_messages_with_retry(self._analysis_model, messages)
 
     async def compress_context(self, messages: list[ChatMessage]) -> str:
         text = "\n".join(f"{m.role}: {m.content}" for m in messages)
-        return await self._call(self._summary_model, COMPRESS_SYSTEM, text)
+        return await self._call_with_retry(self._summary_model, COMPRESS_SYSTEM, text)
 
     async def extract_topic(self, user_input: str, available_topics: list[str]) -> str | None:
         system = EXTRACT_TOPIC_SYSTEM.format(topics=", ".join(available_topics))
-        result = await self._call(self._summary_model, system, user_input)
+        result = await self._call_with_retry(self._summary_model, system, user_input)
         result = result.strip().lower()
         return result if result != "none" and result in available_topics else None
 
     async def summarize_single(self, article: Article) -> str:
         text = f"标题: {article.title}\n内容: {article.content[:3000]}"
-        return await self._call(self._summary_model, SINGLE_SUMMARY_SYSTEM, text)
+        return await self._call_with_retry(self._summary_model, SINGLE_SUMMARY_SYSTEM, text)
 
-    async def _call(self, model: str, system: str, user_text: str) -> str:
-        start = time.time()
+    async def _call_with_retry(self, model: str, system: str, user_text: str) -> str:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ]
+        return await self._call_messages_with_retry(model, messages)
+
+    async def _call_messages_with_retry(self, model: str, messages: list[dict]) -> str:
+        """Call with 1 retry (2s delay). On analysis_model failure, degrade to summary_model."""
         try:
-            response = self._client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_text},
-                ],
-                max_tokens=2048,
-            )
-            result = response.choices[0].message.content
-            elapsed = time.time() - start
-            tokens = response.usage.total_tokens
-            logger.info("OpenAI %s call: %.1fs, %d tokens", model, elapsed, tokens)
-            return result
-        except Exception:
-            logger.error("OpenAI API call failed (model=%s)", model, exc_info=True)
+            return await self._call_messages(model, messages)
+        except openai.RateLimitError:
             raise
+        except Exception:
+            logger.warning("OpenAI %s call failed, retrying in 2s...", model)
+            await asyncio.sleep(2)
+            try:
+                return await self._call_messages(model, messages)
+            except Exception:
+                if model == self._analysis_model and model != self._summary_model:
+                    logger.warning("Degrading from %s to %s", model, self._summary_model)
+                    return await self._call_messages(self._summary_model, messages)
+                raise
 
     async def _call_messages(self, model: str, messages: list[dict]) -> str:
         start = time.time()
         try:
-            response = self._client.chat.completions.create(
+            response = await self._client.chat.completions.create(
                 model=model,
                 messages=messages,
                 max_tokens=2048,
@@ -1806,13 +1874,9 @@ git commit -m "feat: LLM layer with Claude and OpenAI implementations"
 Create `tests/test_topics.py`:
 
 ```python
-import asyncio
 from unittest.mock import AsyncMock
 from core.topics import TopicMatcher
 from config import RSSSource, RedditSource, SourcesConfig
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 def make_sources_config() -> SourcesConfig:
@@ -1828,39 +1892,39 @@ def make_sources_config() -> SourcesConfig:
     )
 
 
-def test_keyword_match_exact():
+async def test_keyword_match_exact():
     matcher = TopicMatcher(make_sources_config(), llm=None)
-    result = run(matcher.match("ai"))
+    result = await matcher.match("ai")
     assert result == "ai"
 
 
-def test_keyword_match_chinese():
+async def test_keyword_match_chinese():
     matcher = TopicMatcher(make_sources_config(), llm=None)
-    result = run(matcher.match("AI 最新资讯"))
+    result = await matcher.match("AI 最新资讯")
     assert result == "ai"
 
 
-def test_keyword_match_international():
+async def test_keyword_match_international():
     matcher = TopicMatcher(make_sources_config(), llm=None)
-    result = run(matcher.match("国际局势"))
+    result = await matcher.match("国际局势")
     assert result == "international"
 
 
-def test_keyword_no_match_falls_back_to_llm():
+async def test_keyword_no_match_falls_back_to_llm():
     mock_llm = AsyncMock()
     mock_llm.extract_topic = AsyncMock(return_value="ai")
     matcher = TopicMatcher(make_sources_config(), llm=mock_llm)
-    result = run(matcher.match("人工智能最近有什么突破"))
+    result = await matcher.match("人工智能最近有什么突破")
     # keyword match should find "ai" via "人工智能" mapping
     # but if it doesn't, LLM fallback kicks in
     assert result in ["ai", "tech", "international"]
 
 
-def test_no_match_returns_none():
+async def test_no_match_returns_none():
     mock_llm = AsyncMock()
     mock_llm.extract_topic = AsyncMock(return_value=None)
     matcher = TopicMatcher(make_sources_config(), llm=mock_llm)
-    result = run(matcher.match("今天天气怎么样"))
+    result = await matcher.match("今天天气怎么样")
     assert result is None
 
 
@@ -1947,7 +2011,7 @@ class TopicMatcher:
 
         return None
 
-    def get_sources_for_topic(self, topic: str) -> list[BaseSource]:
+    def get_sources_for_topic(self, topic: str, custom_feeds: list[dict] | None = None) -> list[BaseSource]:
         sources: list[BaseSource] = []
         for rss in self._sources_config.rss:
             if topic in rss.topics:
@@ -1955,6 +2019,11 @@ class TopicMatcher:
         for reddit in self._sources_config.reddit:
             if topic in reddit.topics:
                 sources.append(RedditSource(subreddit=reddit.subreddit, topics=reddit.topics))
+        # Include user's custom feeds that match the topic
+        if custom_feeds:
+            for feed in custom_feeds:
+                if topic in feed["topics"]:
+                    sources.append(RSSSource(name=feed["name"], url=feed["url"], topics=feed["topics"]))
         return sources
 ```
 
@@ -1983,14 +2052,10 @@ git commit -m "feat: topic matching with keyword map and LLM fallback"
 Create `tests/test_pipeline.py`:
 
 ```python
-import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 from storage.models import Article
 from core.pipeline import Pipeline
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 def make_articles(n: int) -> list[Article]:
@@ -2006,7 +2071,7 @@ def make_articles(n: int) -> list[Article]:
     ]
 
 
-def test_pipeline_fetches_and_summarizes():
+async def test_pipeline_fetches_and_summarizes():
     mock_source = AsyncMock()
     mock_source.fetch = AsyncMock(return_value=make_articles(3))
 
@@ -2017,15 +2082,15 @@ def test_pipeline_fetches_and_summarizes():
     mock_db.get_cached_article = AsyncMock(return_value=None)
     mock_db.cache_article = AsyncMock()
 
-    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=20, max_concurrency=5)
-    summary, articles = run(pipeline.run(sources=[mock_source], topic="ai"))
+    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=20, max_concurrency=5, cache_ttl=3600)
+    summary, articles = await pipeline.run(sources=[mock_source], topic="ai")
 
     assert summary == "Summary of 3 articles"
     assert len(articles) == 3
     mock_llm.summarize.assert_called_once()
 
 
-def test_pipeline_deduplicates_by_url():
+async def test_pipeline_deduplicates_by_url():
     articles_a = [
         Article(title="A", url="https://example.com/1", source="S1",
                 published_at=datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc), content="C1"),
@@ -2050,15 +2115,15 @@ def test_pipeline_deduplicates_by_url():
     mock_db.get_cached_article = AsyncMock(return_value=None)
     mock_db.cache_article = AsyncMock()
 
-    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=20, max_concurrency=5)
-    _, articles = run(pipeline.run(sources=[source_a, source_b], topic="ai"))
+    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=20, max_concurrency=5, cache_ttl=3600)
+    _, articles = await pipeline.run(sources=[source_a, source_b], topic="ai")
 
     urls = [a.url for a in articles]
     assert len(urls) == 3  # deduped
     assert len(set(urls)) == 3
 
 
-def test_pipeline_limits_max_articles():
+async def test_pipeline_limits_max_articles():
     mock_source = AsyncMock()
     mock_source.fetch = AsyncMock(return_value=make_articles(30))
 
@@ -2068,13 +2133,13 @@ def test_pipeline_limits_max_articles():
     mock_db.get_cached_article = AsyncMock(return_value=None)
     mock_db.cache_article = AsyncMock()
 
-    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=10, max_concurrency=5)
-    _, articles = run(pipeline.run(sources=[mock_source], topic="ai"))
+    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=10, max_concurrency=5, cache_ttl=3600)
+    _, articles = await pipeline.run(sources=[mock_source], topic="ai")
 
     assert len(articles) == 10
 
 
-def test_pipeline_source_failure_continues():
+async def test_pipeline_source_failure_continues():
     good_source = AsyncMock()
     good_source.fetch = AsyncMock(return_value=make_articles(2))
     bad_source = AsyncMock()
@@ -2086,22 +2151,22 @@ def test_pipeline_source_failure_continues():
     mock_db.get_cached_article = AsyncMock(return_value=None)
     mock_db.cache_article = AsyncMock()
 
-    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=20, max_concurrency=5)
-    summary, articles = run(pipeline.run(sources=[bad_source, good_source], topic="ai"))
+    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=20, max_concurrency=5, cache_ttl=3600)
+    summary, articles = await pipeline.run(sources=[bad_source, good_source], topic="ai")
 
     assert len(articles) == 2
     assert summary == "Summary"
 
 
-def test_pipeline_all_sources_fail():
+async def test_pipeline_all_sources_fail():
     bad_source = AsyncMock()
     bad_source.fetch = AsyncMock(side_effect=Exception("Fail"))
 
     mock_llm = AsyncMock()
     mock_db = AsyncMock()
 
-    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=20, max_concurrency=5)
-    summary, articles = run(pipeline.run(sources=[bad_source], topic="ai"))
+    pipeline = Pipeline(llm=mock_llm, db=mock_db, max_articles=20, max_concurrency=5, cache_ttl=3600)
+    summary, articles = await pipeline.run(sources=[bad_source], topic="ai")
 
     assert articles == []
     assert "不可用" in summary
@@ -2128,11 +2193,16 @@ from storage.models import Article
 logger = logging.getLogger(__name__)
 
 
+LEVEL3_THRESHOLD = 50  # If extracted content is shorter than this, trigger Level 3 LLM summary
+
+
 class Pipeline:
-    def __init__(self, llm: BaseLLM, db: Database, max_articles: int = 20, max_concurrency: int = 5):
+    def __init__(self, llm: BaseLLM, db: Database, max_articles: int = 20,
+                 max_concurrency: int = 5, cache_ttl: int = 3600):
         self._llm = llm
         self._db = db
         self._max_articles = max_articles
+        self._cache_ttl = cache_ttl
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._preprocessor = Preprocessor()
 
@@ -2155,13 +2225,23 @@ class Pipeline:
         unique.sort(key=lambda a: a.published_at, reverse=True)
         unique = unique[: self._max_articles]
 
-        # Preprocess articles
+        # Preprocess articles (3-level)
         for article in unique:
-            cached = await self._db.get_cached_article(article.url)
+            cached = await self._db.get_cached_article(article.url, cache_ttl=self._cache_ttl)
             if cached and cached.summary:
                 article.summary = cached.summary
             else:
-                article.content = self._preprocessor.extract(article)
+                # Level 1 & 2: preprocessor
+                extracted = self._preprocessor.extract(article)
+                article.content = extracted
+
+                # Level 3: if extracted content is too short, use LLM
+                if len(extracted) < LEVEL3_THRESHOLD and len(article.content) > LEVEL3_THRESHOLD:
+                    try:
+                        article.summary = await self._llm.summarize_single(article)
+                    except Exception:
+                        logger.warning("Level 3 LLM summary failed for %s", article.url)
+
                 await self._db.cache_article(article)
 
         # Summarize with LLM
@@ -2221,17 +2301,13 @@ git commit -m "feat: pipeline with concurrent fetch, dedup, preprocess, and summ
 Create `tests/test_conversation.py`:
 
 ```python
-import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 from core.conversation import ConversationManager
 from storage.models import ChatMessage
 
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
-
-def test_new_session_created():
+async def test_new_session_created():
     mock_db = AsyncMock()
     mock_db.get_active_session = AsyncMock(return_value=None)
     mock_db.save_session = AsyncMock()
@@ -2239,14 +2315,14 @@ def test_new_session_created():
     mock_db.get_messages = AsyncMock(return_value=[])
 
     mgr = ConversationManager(db=mock_db, session_timeout=600)
-    session = run(mgr.get_or_create_session(chat_id=123, topic="ai", articles_json="[]"))
+    session = await mgr.get_or_create_session(chat_id=123, topic="ai", articles_json="[]")
 
     assert session.topic == "ai"
     assert session.chat_id == 123
     mock_db.save_session.assert_called_once()
 
 
-def test_existing_session_reused():
+async def test_existing_session_reused():
     mock_db = AsyncMock()
     mock_db.get_active_session = AsyncMock(return_value={
         "id": "existing-id",
@@ -2259,13 +2335,13 @@ def test_existing_session_reused():
     mock_db.get_messages = AsyncMock(return_value=[])
 
     mgr = ConversationManager(db=mock_db, session_timeout=600)
-    session = run(mgr.get_or_create_session(chat_id=123, topic="ai", articles_json="[]"))
+    session = await mgr.get_or_create_session(chat_id=123, topic="ai", articles_json="[]")
 
     assert session.id == "existing-id"
     mock_db.save_session.assert_not_called()
 
 
-def test_expired_session_creates_new():
+async def test_expired_session_creates_new():
     mock_db = AsyncMock()
     mock_db.get_active_session = AsyncMock(return_value={
         "id": "old-id",
@@ -2279,13 +2355,13 @@ def test_expired_session_creates_new():
     mock_db.get_messages = AsyncMock(return_value=[])
 
     mgr = ConversationManager(db=mock_db, session_timeout=600)
-    session = run(mgr.get_or_create_session(chat_id=123, topic="ai", articles_json="[]"))
+    session = await mgr.get_or_create_session(chat_id=123, topic="ai", articles_json="[]")
 
     assert session.id != "old-id"
     mock_db.save_session.assert_called_once()
 
 
-def test_different_topic_creates_new():
+async def test_different_topic_creates_new():
     mock_db = AsyncMock()
     mock_db.get_active_session = AsyncMock(return_value={
         "id": "old-id",
@@ -2299,13 +2375,13 @@ def test_different_topic_creates_new():
     mock_db.get_messages = AsyncMock(return_value=[])
 
     mgr = ConversationManager(db=mock_db, session_timeout=600)
-    session = run(mgr.get_or_create_session(chat_id=123, topic="ai", articles_json="[]"))
+    session = await mgr.get_or_create_session(chat_id=123, topic="ai", articles_json="[]")
 
     assert session.topic == "ai"
     assert session.id != "old-id"
 
 
-def test_add_and_get_messages():
+async def test_add_and_get_messages():
     mock_db = AsyncMock()
     mock_db.add_message = AsyncMock()
     mock_db.get_messages = AsyncMock(return_value=[
@@ -2314,10 +2390,10 @@ def test_add_and_get_messages():
     ])
     mock_db.touch_session = AsyncMock()
 
-    mgr = ConversationManager(db=mock_db, session_timeout=600)
-    run(mgr.add_message(session_id="s1", role="user", content="hello"))
+    mgr = ConversationManager(db=mock_db, session_timeout=600, llm=None)
+    await mgr.add_message(session_id="s1", role="user", content="hello")
 
-    messages = run(mgr.get_context(session_id="s1", max_messages=10))
+    messages = await mgr.get_context(session_id="s1", max_messages=10)
     assert len(messages) == 2
     assert messages[0].role == "user"
 ```
@@ -2341,11 +2417,15 @@ from storage.models import ChatMessage, Session
 
 logger = logging.getLogger(__name__)
 
+MAX_CONTEXT_MESSAGES = 10
+MAX_CONTEXT_TOKENS_ESTIMATE = 4000  # ~4 chars per token for Chinese
+
 
 class ConversationManager:
-    def __init__(self, db: Database, session_timeout: int = 600):
+    def __init__(self, db: Database, session_timeout: int = 600, llm=None):
         self._db = db
         self._timeout = session_timeout
+        self._llm = llm  # For context compression
 
     async def get_or_create_session(
         self, chat_id: int, topic: str, articles_json: str
@@ -2381,13 +2461,30 @@ class ConversationManager:
         await self._db.add_message(session_id=session_id, role=role, content=content)
         await self._db.touch_session(session_id)
 
-    async def get_context(self, session_id: str, max_messages: int = 10) -> list[ChatMessage]:
+    async def get_context(self, session_id: str, max_messages: int = MAX_CONTEXT_MESSAGES) -> list[ChatMessage]:
         rows = await self._db.get_messages(session_id)
         messages = [
             ChatMessage(role=r["role"], content=r["content"])
             for r in rows
         ]
-        # Keep only the most recent messages
+
+        # Check if compression is needed (by count or estimated token size)
+        total_chars = sum(len(m.content) for m in messages)
+        estimated_tokens = total_chars // 4
+        needs_compression = len(messages) > max_messages or estimated_tokens > MAX_CONTEXT_TOKENS_ESTIMATE
+
+        if needs_compression and self._llm and len(messages) > 2:
+            # Compress older messages, keep recent ones
+            split = max(len(messages) - 4, 1)  # Keep last 4 messages
+            old_messages = messages[:split]
+            recent_messages = messages[split:]
+            try:
+                compressed = await self._llm.compress_context(old_messages)
+                return [ChatMessage(role="assistant", content=f"[对话摘要] {compressed}")] + recent_messages
+            except Exception:
+                logger.warning("Context compression failed, falling back to truncation")
+
+        # Fallback: simple truncation
         if len(messages) > max_messages:
             messages = messages[-max_messages:]
         return messages
@@ -2430,12 +2527,8 @@ Create `bot/__init__.py` (empty file).
 Create `tests/test_handlers.py`:
 
 ```python
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from bot.handlers import AssistBotHandlers
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 def make_update(text: str, chat_id: int = 123, user_id: int = 111):
@@ -2488,44 +2581,44 @@ def make_handlers():
     )
 
 
-def test_unauthorized_user_rejected():
+async def test_unauthorized_user_rejected():
     handlers = make_handlers()
     update = make_update("/start", user_id=999)
-    run(handlers.start(update, make_context()))
+    await handlers.start(update, make_context())
     update.message.reply_text.assert_called_once()
     assert "没有使用权限" in update.message.reply_text.call_args[0][0]
 
 
-def test_start_command():
+async def test_start_command():
     handlers = make_handlers()
     update = make_update("/start", user_id=111)
-    run(handlers.start(update, make_context()))
+    await handlers.start(update, make_context())
     update.message.reply_html.assert_called_once()
     reply = update.message.reply_html.call_args[0][0]
     assert "AssistBot" in reply
 
 
-def test_help_command():
+async def test_help_command():
     handlers = make_handlers()
     update = make_update("/help", user_id=111)
-    run(handlers.help_cmd(update, make_context()))
+    await handlers.help_cmd(update, make_context())
     update.message.reply_html.assert_called_once()
 
 
-def test_topic_command():
+async def test_topic_command():
     handlers = make_handlers()
     update = make_update("/topic ai", user_id=111)
     ctx = make_context()
     ctx.args = ["ai"]
-    run(handlers.topic_cmd(update, ctx))
+    await handlers.topic_cmd(update, ctx)
     # Should call pipeline and reply
     handlers._pipeline.run.assert_called_once()
 
 
-def test_sources_command():
+async def test_sources_command():
     handlers = make_handlers()
     update = make_update("/sources", user_id=111)
-    run(handlers.sources_cmd(update, make_context()))
+    await handlers.sources_cmd(update, make_context())
     update.message.reply_html.assert_called_once()
 ```
 
@@ -2539,6 +2632,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'bot.handlers'`
 ```python
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from telegram import Update
@@ -2572,7 +2666,7 @@ HELP_MSG = """<b>📖 命令列表</b>
 /sources — 查看已配置的数据源列表
 /addrss &lt;url&gt; — 添加自定义 RSS 源
 /removerss &lt;url&gt; — 移除 RSS 源
-/model — 查看当前 LLM 后端
+/model — 查看当前 LLM 后端（MVP 暂不支持切换）
 /help — 帮助信息
 
 也可以直接发送自然语言查询，如"AI 最新资讯"。"""
@@ -2642,12 +2736,13 @@ class AssistBotHandlers:
         if not await self._check_auth(update):
             return
         if not context.args:
-            await update.message.reply_text("请提供 RSS URL，如: /addrss https://example.com/rss")
+            await update.message.reply_text("用法: /addrss <url> [topic]\n示例: /addrss https://example.com/rss ai")
             return
         url = context.args[0]
+        topic = context.args[1] if len(context.args) > 1 else "custom"
         chat_id = update.effective_chat.id
-        await self._db.add_custom_feed(chat_id=chat_id, name=url, url=url, topics=["custom"])
-        await update.message.reply_text(f"已添加 RSS 源: {url}")
+        await self._db.add_custom_feed(chat_id=chat_id, name=url, url=url, topics=[topic])
+        await update.message.reply_text(f"已添加 RSS 源: {url} (话题: {topic})")
 
     async def removerss_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_auth(update):
@@ -2699,25 +2794,37 @@ class AssistBotHandlers:
             )
             return
 
-        # Show typing indicator
+        # Show typing indicator (keep sending during the whole operation)
         await update.message.reply_text("🔍 正在为你搜集资讯...")
-        await update.message.chat.send_action(ChatAction.TYPING)
+        typing_task = asyncio.create_task(self._keep_typing(update))
+        try:
+            # Get sources (including user's custom feeds) and run pipeline
+            custom_feeds = await self._db.get_custom_feeds(chat_id)
+            sources = self._topic_matcher.get_sources_for_topic(topic, custom_feeds=custom_feeds)
+            summary, articles = await self._pipeline.run(sources=sources, topic=topic)
 
-        # Get sources and run pipeline
-        sources = self._topic_matcher.get_sources_for_topic(topic)
-        summary, articles = await self._pipeline.run(sources=sources, topic=topic)
+            # Create session
+            articles_json = json.dumps(
+                [{"title": a.title, "url": a.url, "source": a.source} for a in articles]
+            )
+            session = await self._conversation.get_or_create_session(
+                chat_id=chat_id, topic=topic, articles_json=articles_json
+            )
+            await self._conversation.add_message(session.id, "assistant", summary)
 
-        # Create session
-        articles_json = json.dumps(
-            [{"title": a.title, "url": a.url, "source": a.source} for a in articles]
-        )
-        session = await self._conversation.get_or_create_session(
-            chat_id=chat_id, topic=topic, articles_json=articles_json
-        )
-        await self._conversation.add_message(session.id, "assistant", summary)
+            # Send response (handle message length)
+            await self._send_long_message(update, summary)
+        finally:
+            typing_task.cancel()
 
-        # Send response (handle message length)
-        await self._send_long_message(update, summary)
+    async def _keep_typing(self, update: Update) -> None:
+        """Continuously send typing action every 5 seconds."""
+        try:
+            while True:
+                await update.message.chat.send_action(ChatAction.TYPING)
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            pass
 
     async def _handle_followup(self, update: Update, text: str) -> None:
         chat_id = update.effective_chat.id
@@ -2782,7 +2889,7 @@ from storage.database import Database
 logger = logging.getLogger(__name__)
 
 
-def create_bot(config: AppConfig, llm: BaseLLM, db: Database) -> Application:
+def create_bot(config: AppConfig, llm: BaseLLM, db: Database, post_init=None) -> Application:
     if not config.telegram.bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
@@ -2791,8 +2898,9 @@ def create_bot(config: AppConfig, llm: BaseLLM, db: Database) -> Application:
         llm=llm, db=db,
         max_articles=config.max_articles,
         max_concurrency=config.max_concurrency,
+        cache_ttl=config.cache_ttl,
     )
-    conversation = ConversationManager(db=db, session_timeout=config.session_timeout)
+    conversation = ConversationManager(db=db, session_timeout=config.session_timeout, llm=llm)
 
     handlers = AssistBotHandlers(
         pipeline=pipeline,
@@ -2803,7 +2911,10 @@ def create_bot(config: AppConfig, llm: BaseLLM, db: Database) -> Application:
         allowed_users=config.telegram.allowed_users,
     )
 
-    app = Application.builder().token(config.telegram.bot_token).build()
+    builder = Application.builder().token(config.telegram.bot_token)
+    if post_init:
+        builder = builder.post_init(post_init)
+    app = builder.build()
 
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("help", handlers.help_cmd))
@@ -2857,14 +2968,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def main() -> None:
+def main() -> None:
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     logger.info("Loading config from %s", config_path)
     config = load_config(config_path)
 
     logger.info("Initializing database...")
-    db = Database()
-    await db.init()
+    db = Database(config.db_path)
+    # DB init needs to happen inside the event loop that run_polling creates,
+    # so we register it as a post_init callback
+    async def post_init(application):
+        await db.init()
 
     logger.info("Initializing LLM provider: %s", config.llm.provider)
     if not config.llm.api_key:
@@ -2879,12 +2993,13 @@ async def main() -> None:
     )
 
     logger.info("Starting Telegram bot...")
-    app = create_bot(config, llm, db)
-    await app.run_polling()
+    app = create_bot(config, llm, db, post_init=post_init)
+    # run_polling() is a blocking synchronous method that manages its own event loop
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 ```
 
 - [ ] **Step 2: Verify all tests pass**
