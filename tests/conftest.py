@@ -1,6 +1,17 @@
 import os
 import tempfile
 import pytest
+from storage.database import Database
+
+
+@pytest.fixture
+async def db(tmp_path):
+    db_path = tmp_path / "test.db"
+    database = Database(str(db_path))
+    await database.init()
+    yield database
+    await database.close()
+
 
 @pytest.fixture
 def tmp_config_file():
