@@ -17,11 +17,13 @@ LEVEL3_THRESHOLD = 50  # If extracted content is shorter than this, trigger Leve
 
 class Pipeline:
     def __init__(self, llm: BaseLLM, db: Database, max_articles: int = 20,
-                 max_concurrency: int = 5, cache_ttl: int = 3600):
+                 max_concurrency: int = 5, cache_ttl: int = 3600,
+                 source_timeout: int = 15):
         self._llm = llm
         self._db = db
         self._max_articles = max_articles
         self._cache_ttl = cache_ttl
+        self._source_timeout = source_timeout
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._preprocessor = Preprocessor()
 
@@ -77,7 +79,12 @@ class Pipeline:
         async def fetch_one(source: BaseSource) -> list[Article]:
             async with self._semaphore:
                 try:
-                    return await source.fetch()
+                    return await asyncio.wait_for(
+                        source.fetch(), timeout=self._source_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Source %s timed out after %ds", source.name, self._source_timeout)
+                    return []
                 except Exception:
                     logger.warning("Source %s failed", source.name, exc_info=True)
                     return []

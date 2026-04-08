@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from urllib.parse import urlparse
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ContextTypes
 
@@ -57,6 +58,7 @@ class AssistBotHandlers:
         self._llm = llm
         self._db = db
         self._allowed_users = allowed_users
+        self._pending_more: dict[str, str] = {}  # callback_id -> remaining text
 
     def _is_authorized(self, user_id: int) -> bool:
         return not self._allowed_users or user_id in self._allowed_users
@@ -90,8 +92,8 @@ class AssistBotHandlers:
         if not await self._check_auth(update):
             return
         chat_id = update.effective_chat.id
-        topics = self._topic_matcher.available_topics()
         custom = await self._db.get_custom_feeds(chat_id)
+        topics = self._topic_matcher.available_topics(custom_feeds=custom)
 
         lines = ["<b>📡 数据源列表</b>\n"]
         lines.append(f"<b>支持的话题：</b> {', '.join(topics)}\n")
@@ -156,11 +158,12 @@ class AssistBotHandlers:
 
     async def _handle_topic_query(self, update: Update, query: str) -> None:
         chat_id = update.effective_chat.id
+        custom_feeds = await self._db.get_custom_feeds(chat_id)
 
-        # Match topic
-        topic = await self._topic_matcher.match(query)
+        # Match topic (include custom feeds for topic resolution)
+        topic = await self._topic_matcher.match(query, custom_feeds=custom_feeds)
         if topic is None:
-            available = ", ".join(self._topic_matcher.available_topics())
+            available = ", ".join(self._topic_matcher.available_topics(custom_feeds=custom_feeds))
             await update.message.reply_text(
                 f"未能识别话题。当前支持的话题: {available}\n"
                 f"可以通过 /addrss 添加新的数据源。"
@@ -172,8 +175,6 @@ class AssistBotHandlers:
         typing_task = asyncio.create_task(self._keep_typing(update))
         try:
             # Get sources (including user's custom feeds) and run pipeline
-            custom_feeds = await self._db.get_custom_feeds(chat_id)
-            self._topic_matcher.add_custom_topics(custom_feeds)
             sources = self._topic_matcher.get_sources_for_topic(topic, custom_feeds=custom_feeds)
             summary, articles = await self._pipeline.run(sources=sources, topic=topic)
 
@@ -209,7 +210,7 @@ class AssistBotHandlers:
         chat_id = update.effective_chat.id
         await update.message.chat.send_action(ChatAction.TYPING)
 
-        session_row = await self._db.get_active_session(chat_id)
+        session_row = await self._conversation.get_active_session_if_valid(chat_id)
         if not session_row:
             await self._handle_topic_query(update, text)
             return
@@ -237,21 +238,45 @@ class AssistBotHandlers:
 
     async def _send_long_message(self, update: Update, text: str) -> None:
         if len(text) <= MAX_MESSAGE_LENGTH:
-            await update.message.reply_html(text)
+            await update.message.reply_text(text)
             return
 
-        # Split at last newline before limit
-        chunks: list[str] = []
-        remaining = text
+        # Find a good split point for the overview portion
+        split_at = text.rfind("\n", 0, MAX_MESSAGE_LENGTH)
+        if split_at == -1:
+            split_at = MAX_MESSAGE_LENGTH
+        overview = text[:split_at]
+        remaining = text[split_at:].lstrip("\n")
+
+        if remaining:
+            callback_id = str(uuid.uuid4())[:8]
+            self._pending_more[callback_id] = remaining
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 查看更多", callback_data=f"more:{callback_id}")]
+            ])
+            await update.message.reply_text(overview, reply_markup=keyboard)
+        else:
+            await update.message.reply_text(overview)
+
+    async def handle_show_more(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        if not data.startswith("more:"):
+            return
+        callback_id = data[5:]
+        remaining = self._pending_more.pop(callback_id, None)
+        if not remaining:
+            await query.message.reply_text("内容已过期，请重新查询。")
+            return
+
+        # Send remaining content in chunks if needed
         while remaining:
             if len(remaining) <= MAX_MESSAGE_LENGTH:
-                chunks.append(remaining)
+                await query.message.reply_text(remaining)
                 break
             split_at = remaining.rfind("\n", 0, MAX_MESSAGE_LENGTH)
             if split_at == -1:
                 split_at = MAX_MESSAGE_LENGTH
-            chunks.append(remaining[:split_at])
+            await query.message.reply_text(remaining[:split_at])
             remaining = remaining[split_at:].lstrip("\n")
-
-        for chunk in chunks:
-            await update.message.reply_html(chunk)

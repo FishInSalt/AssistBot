@@ -74,7 +74,7 @@ class Database:
             (article.url, article.title, article.source, article.content,
              article.summary, article.language,
              article.published_at.isoformat() if article.published_at else None,
-             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")),
         )
         await self._commit()
 
@@ -129,7 +129,7 @@ class Database:
     # --- Sessions ---
 
     async def save_session(self, session_id: str, chat_id: int, topic: str, articles_json: str) -> None:
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
         await self._execute(
             """INSERT OR REPLACE INTO sessions (id, chat_id, topic, articles, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -148,7 +148,7 @@ class Database:
         return dict(row)
 
     async def touch_session(self, session_id: str) -> None:
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
         await self._execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
         await self._commit()
 

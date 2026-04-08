@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from bot.handlers import AssistBotHandlers
 from config import AppConfig
@@ -24,6 +24,7 @@ def create_bot(config: AppConfig, llm: BaseLLM, db: Database, post_init=None, po
         max_articles=config.max_articles,
         max_concurrency=config.max_concurrency,
         cache_ttl=config.cache_ttl,
+        source_timeout=config.source_timeout,
     )
     conversation = ConversationManager(db=db, session_timeout=config.session_timeout, llm=llm)
 
@@ -51,6 +52,7 @@ def create_bot(config: AppConfig, llm: BaseLLM, db: Database, post_init=None, po
     app.add_handler(CommandHandler("removerss", handlers.removerss_cmd))
     app.add_handler(CommandHandler("model", handlers.model_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))
+    app.add_handler(CallbackQueryHandler(handlers.handle_show_more, pattern=r"^more:"))
     app.add_error_handler(handlers.error_handler)
 
     return app

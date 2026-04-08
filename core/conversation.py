@@ -10,7 +10,7 @@ from storage.models import ChatMessage, Session
 logger = logging.getLogger(__name__)
 
 MAX_CONTEXT_MESSAGES = 10
-MAX_CONTEXT_TOKENS_ESTIMATE = 4000  # ~4 chars per token for Chinese
+MAX_CONTEXT_TOKENS_ESTIMATE = 4000  # ~2 chars per token for mixed Chinese/English
 
 
 class ConversationManager:
@@ -62,7 +62,7 @@ class ConversationManager:
 
         # Check if compression is needed (by count or estimated token size)
         total_chars = sum(len(m.content) for m in messages)
-        estimated_tokens = total_chars // 4
+        estimated_tokens = total_chars // 2
         needs_compression = len(messages) > max_messages or estimated_tokens > MAX_CONTEXT_TOKENS_ESTIMATE
 
         if needs_compression and self._llm and len(messages) > 2:
@@ -81,10 +81,16 @@ class ConversationManager:
             messages = messages[-max_messages:]
         return messages
 
-    async def has_active_session(self, chat_id: int) -> bool:
+    async def get_active_session_if_valid(self, chat_id: int) -> dict | None:
+        """Return the most recent session if it exists and hasn't expired, else None."""
         existing = await self._db.get_active_session(chat_id)
         if not existing:
-            return False
+            return None
         updated_at = datetime.fromisoformat(existing["updated_at"])
         elapsed = (datetime.now(timezone.utc) - updated_at).total_seconds()
-        return elapsed <= self._timeout
+        if elapsed <= self._timeout:
+            return existing
+        return None
+
+    async def has_active_session(self, chat_id: int) -> bool:
+        return await self.get_active_session_if_valid(chat_id) is not None

@@ -31,18 +31,23 @@ class TopicMatcher:
             topics.update(reddit.topics)
         return topics
 
-    def available_topics(self) -> list[str]:
-        return sorted(self._all_topics)
+    def available_topics(self, custom_feeds: list[dict] | None = None) -> list[str]:
+        topics = self._all_topics.copy()
+        if custom_feeds:
+            for feed in custom_feeds:
+                topics.update(feed["topics"])
+        return sorted(topics)
 
-    def add_custom_topics(self, custom_feeds: list[dict]) -> None:
-        for feed in custom_feeds:
-            self._all_topics.update(feed["topics"])
+    async def match(self, user_input: str, custom_feeds: list[dict] | None = None) -> str | None:
+        effective_topics = set(self._all_topics)
+        if custom_feeds:
+            for feed in custom_feeds:
+                effective_topics.update(feed["topics"])
 
-    async def match(self, user_input: str) -> str | None:
         # Level 1: keyword matching
         user_lower = user_input.lower()
         for topic, keywords in KEYWORD_MAP.items():
-            if topic not in self._all_topics:
+            if topic not in effective_topics:
                 continue
             for kw in keywords:
                 if kw.lower() in user_lower:
@@ -51,7 +56,7 @@ class TopicMatcher:
         # Level 2: LLM fallback
         if self._llm:
             try:
-                result = await self._llm.extract_topic(user_input, list(self._all_topics))
+                result = await self._llm.extract_topic(user_input, list(effective_topics))
                 if result:
                     return result
             except Exception:

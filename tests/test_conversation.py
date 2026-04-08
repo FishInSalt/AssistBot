@@ -26,7 +26,7 @@ async def test_existing_session_reused():
         "chat_id": 123,
         "topic": "ai",
         "articles": "[]",
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00"),
     })
     mock_db.touch_session = AsyncMock()
     mock_db.get_messages = AsyncMock(return_value=[])
@@ -65,7 +65,7 @@ async def test_different_topic_creates_new():
         "chat_id": 123,
         "topic": "tech",
         "articles": "[]",
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00"),
     })
     mock_db.save_session = AsyncMock()
     mock_db.add_message = AsyncMock()
