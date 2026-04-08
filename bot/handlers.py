@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from urllib.parse import urlparse
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import ContextTypes
@@ -10,7 +11,7 @@ from telegram.ext import ContextTypes
 from core.conversation import ConversationManager
 from core.pipeline import Pipeline
 from core.topics import TopicMatcher
-from llm.base import BaseLLM
+from llm.base import BaseLLM, RateLimitException
 from storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,10 @@ class AssistBotHandlers:
             await update.message.reply_text("用法: /addrss <url> [topic]\n示例: /addrss https://example.com/rss ai")
             return
         url = context.args[0]
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            await update.message.reply_text("请提供有效的 HTTP/HTTPS URL。")
+            return
         topic = context.args[1] if len(context.args) > 1 else "custom"
         chat_id = update.effective_chat.id
         await self._db.add_custom_feed(chat_id=chat_id, name=url, url=url, topics=[topic])
@@ -168,6 +173,7 @@ class AssistBotHandlers:
         try:
             # Get sources (including user's custom feeds) and run pipeline
             custom_feeds = await self._db.get_custom_feeds(chat_id)
+            self._topic_matcher.add_custom_topics(custom_feeds)
             sources = self._topic_matcher.get_sources_for_topic(topic, custom_feeds=custom_feeds)
             summary, articles = await self._pipeline.run(sources=sources, topic=topic)
 
@@ -182,6 +188,11 @@ class AssistBotHandlers:
 
             # Send response (handle message length)
             await self._send_long_message(update, summary)
+        except RateLimitException:
+            await update.message.reply_text("请求过于频繁，请稍后再试。")
+        except Exception:
+            logger.error("Topic query failed", exc_info=True)
+            await update.message.reply_text("处理出错，请重试。")
         finally:
             typing_task.cancel()
 
@@ -215,6 +226,14 @@ class AssistBotHandlers:
 
         await self._conversation.add_message(session_id, "assistant", reply)
         await self._send_long_message(update, reply)
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Unhandled exception", exc_info=context.error)
+        if isinstance(update, Update) and update.message:
+            try:
+                await update.message.reply_text("处理出错，请重试。")
+            except Exception:
+                pass
 
     async def _send_long_message(self, update: Update, text: str) -> None:
         if len(text) <= MAX_MESSAGE_LENGTH:

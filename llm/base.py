@@ -2,6 +2,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from storage.models import Article, ChatMessage
 
+
+class RateLimitException(Exception):
+    pass
+
+
 class BaseLLM(ABC):
     @abstractmethod
     async def summarize(self, articles: list[Article], topic: str) -> str: ...

@@ -34,6 +34,10 @@ class TopicMatcher:
     def available_topics(self) -> list[str]:
         return sorted(self._all_topics)
 
+    def add_custom_topics(self, custom_feeds: list[dict]) -> None:
+        for feed in custom_feeds:
+            self._all_topics.update(feed["topics"])
+
     async def match(self, user_input: str) -> str | None:
         # Level 1: keyword matching
         user_lower = user_input.lower()

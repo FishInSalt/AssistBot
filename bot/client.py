@@ -14,7 +14,7 @@ from storage.database import Database
 logger = logging.getLogger(__name__)
 
 
-def create_bot(config: AppConfig, llm: BaseLLM, db: Database, post_init=None) -> Application:
+def create_bot(config: AppConfig, llm: BaseLLM, db: Database, post_init=None, post_shutdown=None) -> Application:
     if not config.telegram.bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
@@ -39,6 +39,8 @@ def create_bot(config: AppConfig, llm: BaseLLM, db: Database, post_init=None) ->
     builder = Application.builder().token(config.telegram.bot_token)
     if post_init:
         builder = builder.post_init(post_init)
+    if post_shutdown:
+        builder = builder.post_shutdown(post_shutdown)
     app = builder.build()
 
     app.add_handler(CommandHandler("start", handlers.start))
@@ -49,5 +51,6 @@ def create_bot(config: AppConfig, llm: BaseLLM, db: Database, post_init=None) ->
     app.add_handler(CommandHandler("removerss", handlers.removerss_cmd))
     app.add_handler(CommandHandler("model", handlers.model_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))
+    app.add_error_handler(handlers.error_handler)
 
     return app

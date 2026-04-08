@@ -26,6 +26,7 @@ def make_handlers():
     mock_topic_matcher = AsyncMock()
     mock_topic_matcher.match = AsyncMock(return_value="ai")
     mock_topic_matcher.available_topics = MagicMock(return_value=["ai", "tech"])
+    mock_topic_matcher.add_custom_topics = MagicMock()
     mock_topic_matcher.get_sources_for_topic = MagicMock(return_value=[])
 
     mock_conversation = AsyncMock()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from core.preprocessor import Preprocessor
 from llm.base import BaseLLM
 from sources.base import BaseSource
@@ -40,7 +41,7 @@ class Pipeline:
                 unique.append(a)
 
         # Sort by published_at descending, limit
-        unique.sort(key=lambda a: a.published_at, reverse=True)
+        unique.sort(key=lambda a: a.published_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         unique = unique[: self._max_articles]
 
         # Preprocess articles (3-level)

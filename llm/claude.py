@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 import anthropic
-from llm.base import BaseLLM
+from llm.base import BaseLLM, RateLimitException
 from storage.models import Article, ChatMessage
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,7 @@ class ClaudeLLM(BaseLLM):
         try:
             return await self._call(model, system, user_text)
         except anthropic.RateLimitError:
-            raise
+            raise RateLimitException("Rate limited") from None
         except Exception:
             logger.warning("Claude %s call failed, retrying in 2s...", model)
             await asyncio.sleep(2)
@@ -87,7 +87,7 @@ class ClaudeLLM(BaseLLM):
         try:
             return await self._call_messages(model, system, messages)
         except anthropic.RateLimitError:
-            raise
+            raise RateLimitException("Rate limited") from None
         except Exception:
             logger.warning("Claude %s call failed, retrying in 2s...", model)
             await asyncio.sleep(2)

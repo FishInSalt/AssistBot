@@ -28,6 +28,9 @@ def main() -> None:
     async def post_init(application):
         await db.init()
 
+    async def post_shutdown(application):
+        await db.close()
+
     logger.info("Initializing LLM provider: %s", config.llm.provider)
     if not config.llm.api_key:
         logger.error("LLM_API_KEY environment variable is required")
@@ -41,7 +44,7 @@ def main() -> None:
     )
 
     logger.info("Starting Telegram bot...")
-    app = create_bot(config, llm, db, post_init=post_init)
+    app = create_bot(config, llm, db, post_init=post_init, post_shutdown=post_shutdown)
     # run_polling() is a blocking synchronous method that manages its own event loop
     app.run_polling()
 

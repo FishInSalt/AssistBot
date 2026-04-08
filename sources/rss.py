@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -22,7 +23,7 @@ class RSSSource(BaseSource):
         except Exception:
             logger.warning("RSS fetch failed for %s (%s)", self.name, self.url)
             return []
-        feed = feedparser.parse(response.text)
+        feed = await asyncio.to_thread(feedparser.parse, response.text)
         articles = []
         for entry in feed.entries:
             published_at = self._parse_date(entry)

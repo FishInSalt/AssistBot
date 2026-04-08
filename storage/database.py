@@ -23,7 +23,8 @@ class Database:
                 name TEXT NOT NULL,
                 url TEXT NOT NULL,
                 topics TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, url)
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -104,7 +105,7 @@ class Database:
 
     async def add_custom_feed(self, chat_id: int, name: str, url: str, topics: list[str]) -> None:
         await self._execute(
-            "INSERT INTO custom_feeds (chat_id, name, url, topics) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO custom_feeds (chat_id, name, url, topics) VALUES (?, ?, ?, ?)",
             (chat_id, name, url, json.dumps(topics)),
         )
         await self._commit()
@@ -128,7 +129,7 @@ class Database:
     # --- Sessions ---
 
     async def save_session(self, session_id: str, chat_id: int, topic: str, articles_json: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         await self._execute(
             """INSERT OR REPLACE INTO sessions (id, chat_id, topic, articles, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -147,7 +148,7 @@ class Database:
         return dict(row)
 
     async def touch_session(self, session_id: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         await self._execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
         await self._commit()
 

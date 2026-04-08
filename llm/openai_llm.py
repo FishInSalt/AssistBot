@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 import openai
-from llm.base import BaseLLM
+from llm.base import BaseLLM, RateLimitException
 from storage.models import Article, ChatMessage
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class OpenAILLM(BaseLLM):
         try:
             return await self._call_messages(model, messages)
         except openai.RateLimitError:
-            raise
+            raise RateLimitException("Rate limited") from None
         except Exception:
             logger.warning("OpenAI %s call failed, retrying in 2s...", model)
             await asyncio.sleep(2)

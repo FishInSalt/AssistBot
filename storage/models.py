@@ -9,8 +9,8 @@ class Article:
     title: str
     url: str
     source: str
-    published_at: datetime
     content: str
+    published_at: datetime | None = None
     language: str = "zh"
     summary: str | None = None
 
