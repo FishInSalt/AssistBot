@@ -705,7 +705,7 @@ class Database:
             (article.url, article.title, article.source, article.content,
              article.summary, article.language,
              article.published_at.isoformat() if article.published_at else None,
-             datetime.now(timezone.utc).isoformat()),
+             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
         )
         await self._commit()
 
@@ -713,7 +713,7 @@ class Database:
         if cache_ttl > 0:
             cursor = await self._execute(
                 """SELECT * FROM article_cache
-                   WHERE url = ? AND cached_at > datetime('now', ? || ' seconds')""",
+                   WHERE url = ? AND datetime(cached_at) > datetime('now', ? || ' seconds')""",
                 (url, str(-cache_ttl)),
             )
         else:
@@ -2232,11 +2232,12 @@ class Pipeline:
                 article.summary = cached.summary
             else:
                 # Level 1 & 2: preprocessor
+                original_content = article.content
                 extracted = self._preprocessor.extract(article)
                 article.content = extracted
 
-                # Level 3: if extracted content is too short, use LLM
-                if len(extracted) < LEVEL3_THRESHOLD and len(article.content) > LEVEL3_THRESHOLD:
+                # Level 3: if extracted content is too short but original was substantial, use LLM
+                if len(extracted) < LEVEL3_THRESHOLD and len(original_content) > LEVEL3_THRESHOLD:
                     try:
                         article.summary = await self._llm.summarize_single(article)
                     except Exception:
