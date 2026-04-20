@@ -1,0 +1,42 @@
+telegram:
+  # bot_token: set TELEGRAM_BOT_TOKEN env var
+  allowed_users: []
+
+llm:
+  provider: "claude"
+  # api_key: set LLM_API_KEY env var
+  summary_model: "claude-haiku-4-5-20251001"
+  analysis_model: "claude-sonnet-4-6"
+
+sources:
+  rss:
+    - name: "机器之心"
+      url: "https://www.jiqizhixin.com/rss"
+      topics: ["ai"]
+    - name: "36氪"
+      url: "https://36kr.com/feed"
+      topics: ["tech", "ai"]
+    - name: "虎嗅"
+      url: "https://www.huxiu.com/rss/0.xml"
+      topics: ["tech"]
+    - name: "少数派"
+      url: "https://sspai.com/feed"
+      topics: ["tech"]
+    - name: "澎湃新闻"
+      url: "https://rsshub.app/thepaper/newsDetail_channel/25950"
+      topics: ["international"]
+    - name: "知乎热榜"
+      url: "https://rsshub.app/zhihu/hot"
+      topics: ["general"]
+  reddit:
+    - subreddit: "artificial"
+      topics: ["ai"]
+    - subreddit: "worldnews"
+      topics: ["international"]
+
+db_path: "assistbot.db"
+cache_ttl: 3600
+max_articles: 20
+session_timeout: 600
+max_concurrency: 5
+source_timeout: 15
